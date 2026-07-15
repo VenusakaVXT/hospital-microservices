@@ -1,5 +1,7 @@
 using Microsoft.EntityFrameworkCore;
+using ReceptionAPI.BackgroundServices;
 using ReceptionAPI.Data;
+using ReceptionAPI.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -35,21 +37,44 @@ builder.Services.AddSwaggerGen(c =>
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. LOGGING
+// 3. ĐĂNG KÝ SERVICES — NGÀY 2: OUTBOX PATTERN
+// ─────────────────────────────────────────────────────────────────────────────
+// PatientService: Scoped — tạo mới mỗi HTTP request (an toàn với DbContext)
+builder.Services.AddScoped<IPatientService, PatientService>();
+
+// OutboxPublisherWorker: Hosted Service (Singleton) chạy ngầm suốt vòng đời app
+// Dùng IServiceScopeFactory bên trong để tạo scope cho DbContext
+builder.Services.AddHostedService<OutboxPublisherWorker>();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. LOGGING
 // ─────────────────────────────────────────────────────────────────────────────
 builder.Logging.AddConsole();
 
 var app = builder.Build();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. TỰ ĐỘNG MIGRATE DATABASE KHI KHỞI ĐỘNG (Development only)
+// 5. TỰ ĐỘNG MIGRATE DATABASE KHI KHỞI ĐỘNG (Development only)
+//    LƯU Ý: Nếu dùng restricted user (venusdev), DB phải được tạo trước bằng SA.
+//    → Lần đầu setup, chạy thủ công: dotnet ef database update
 // ─────────────────────────────────────────────────────────────────────────────
 if (app.Environment.IsDevelopment())
 {
     using var scope = app.Services.CreateScope();
     var db = scope.ServiceProvider.GetRequiredService<ReceptionDbContext>();
-    db.Database.Migrate(); // Chạy toàn bộ migration chưa được áp dụng
+    try
+    {
+        db.Database.Migrate();
+        app.Logger.LogInformation("Database migration applied successfully.");
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogWarning(
+            "Auto-migration skipped: {Message}. Run 'dotnet ef database update' manually.",
+            ex.Message);
+    }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. PIPELINE
