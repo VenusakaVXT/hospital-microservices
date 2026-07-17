@@ -2,6 +2,7 @@ using Confluent.Kafka;
 using System.Text.Json;
 using ClinicalAPI.Data;
 using ClinicalAPI.Models;
+using ClinicalAPI.Services;
 using Microsoft.EntityFrameworkCore;
 
 namespace ClinicalAPI.BackgroundServices;
@@ -105,6 +106,7 @@ public class KafkaConsumerWorker : BackgroundService
         // 2. Tạo scope để lấy ClinicalDbContext
         await using var scope = _scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<ClinicalDbContext>();
+        var elasticService = scope.ServiceProvider.GetRequiredService<ElasticSearchService>();
 
         // Kiểm tra xem bệnh nhân đã có hồ sơ chờ chưa để tránh trùng lặp
         var existingRecord = await db.MedicalRecords
@@ -130,5 +132,8 @@ public class KafkaConsumerWorker : BackgroundService
         await db.SaveChangesAsync(stoppingToken);
 
         _logger.LogInformation("✅ Successfully created medical record for patient '{FullName}'.", record.PatientName);
+
+        // Đồng bộ lên Elasticsearch
+        await elasticService.IndexMedicalRecordAsync(record);
     }
 }

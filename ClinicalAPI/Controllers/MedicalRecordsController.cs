@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using ClinicalAPI.Models;
 using ClinicalAPI.Data;
+using ClinicalAPI.Services;
 
 namespace ClinicalAPI.Controllers;
 
@@ -11,11 +12,13 @@ namespace ClinicalAPI.Controllers;
 public class MedicalRecordsController : ControllerBase
 {
     private readonly ClinicalDbContext _db;
+    private readonly ElasticSearchService _elasticService;
     private readonly ILogger<MedicalRecordsController> _logger;
 
-    public MedicalRecordsController(ClinicalDbContext db, ILogger<MedicalRecordsController> logger)
+    public MedicalRecordsController(ClinicalDbContext db, ElasticSearchService elasticService, ILogger<MedicalRecordsController> logger)
     {
         _db = db;
+        _elasticService = elasticService;
         _logger = logger;
     }
 
@@ -41,6 +44,14 @@ public class MedicalRecordsController : ControllerBase
         return Ok(records);
     }
 
+    [HttpGet("search")]
+    public async Task<ActionResult<IEnumerable<MedicalRecord>>> Search([FromQuery] string keyword)
+    {
+        if (string.IsNullOrWhiteSpace(keyword)) return BadRequest("Keyword is required");
+        var results = await _elasticService.SearchMedicalRecordsAsync(keyword);
+        return Ok(results);
+    }
+
     [HttpGet("{id}")]
     public async Task<ActionResult<MedicalRecord>> GetById(Guid id, CancellationToken cancellationToken)
     {
@@ -55,6 +66,9 @@ public class MedicalRecordsController : ControllerBase
         _db.MedicalRecords.Add(record);
         await _db.SaveChangesAsync(cancellationToken);
 
+        // Đồng bộ lên Elasticsearch
+        await _elasticService.IndexMedicalRecordAsync(record);
+
         return CreatedAtAction(nameof(GetById), new { id = record.Id }, record);
     }
 
@@ -68,6 +82,8 @@ public class MedicalRecordsController : ControllerBase
         try
         {
             await _db.SaveChangesAsync(cancellationToken);
+            // Đồng bộ cập nhật lên Elasticsearch
+            await _elasticService.IndexMedicalRecordAsync(record);
         }
         catch (DbUpdateConcurrencyException)
         {
@@ -89,6 +105,26 @@ public class MedicalRecordsController : ControllerBase
         _db.MedicalRecords.Remove(record);
         await _db.SaveChangesAsync(cancellationToken);
 
+        // Xóa khỏi Elasticsearch
+        await _elasticService.DeleteMedicalRecordAsync(id);
+
         return NoContent();
+    }
+
+    /// <summary>
+    /// Đồng bộ toàn bộ dữ liệu từ Oracle DB lên Elasticsearch.
+    /// Rất hữu ích khi insert dữ liệu bằng lệnh SQL thuần.
+    /// </summary>
+    [HttpPost("sync-all")]
+    public async Task<IActionResult> SyncAllToElastic(CancellationToken cancellationToken)
+    {
+        var allRecords = await _db.MedicalRecords.ToListAsync(cancellationToken);
+        int count = 0;
+        foreach (var record in allRecords)
+        {
+            await _elasticService.IndexMedicalRecordAsync(record);
+            count++;
+        }
+        return Ok(new { message = $"Đã đồng bộ thành công {count} hồ sơ bệnh án lên Elasticsearch!" });
     }
 }

@@ -25,6 +25,7 @@ builder.Services.AddDbContext<ClinicalDbContext>(options =>
 // ─────────────────────────────────────────────────────────────────────────────
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp => 
     ConnectionMultiplexer.Connect(builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379"));
+builder.Services.AddSingleton<ElasticSearchService>();
 builder.Services.AddScoped<MedicineService>();
 builder.Services.AddHostedService<KafkaConsumerWorker>();
 builder.Services.AddControllers();
@@ -57,7 +58,16 @@ if (app.Environment.IsDevelopment())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. PIPELINE
+// 5. KHỞI TẠO ELASTICSEARCH INDEX
+// ─────────────────────────────────────────────────────────────────────────────
+using (var scope = app.Services.CreateScope())
+{
+    var elasticService = scope.ServiceProvider.GetRequiredService<ElasticSearchService>();
+    await elasticService.CreateIndexIfNotExistsAsync();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. PIPELINE
 // ─────────────────────────────────────────────────────────────────────────────
 if (app.Environment.IsDevelopment())
 {
