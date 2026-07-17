@@ -13,6 +13,7 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Oracle.EntityFrameworkCore" Version="8.21.121" />
+    <PackageReference Include="StackExchange.Redis" Version="3.0.17" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
   </ItemGroup>
 

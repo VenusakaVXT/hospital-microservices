@@ -2,6 +2,9 @@ using Microsoft.EntityFrameworkCore;
 using ClinicalAPI.Data;
 using ClinicalAPI.BackgroundServices;
 
+using StackExchange.Redis;
+using ClinicalAPI.Services;
+
 var builder = WebApplication.CreateBuilder(args);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -20,6 +23,9 @@ builder.Services.AddDbContext<ClinicalDbContext>(options =>
 // ─────────────────────────────────────────────────────────────────────────────
 // 2. CÁC DỊCH VỤ TIÊU CHUẨN & BACKGROUND SERVICES
 // ─────────────────────────────────────────────────────────────────────────────
+builder.Services.AddSingleton<IConnectionMultiplexer>(sp => 
+    ConnectionMultiplexer.Connect(builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379"));
+builder.Services.AddScoped<MedicineService>();
 builder.Services.AddHostedService<KafkaConsumerWorker>();
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
