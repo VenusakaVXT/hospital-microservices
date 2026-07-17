@@ -81,31 +81,41 @@ CÓ TRANSACTION:
   Kết quả: Không có gì được lưu -> client biết và thử lại
 ```
 
-### Cơ Chế Trong Code
+### Cơ Chế Trong Code (Cách Thực Tế Triển Khai)
+
+> ⚠️ **Lưu ý quan trọng:** Khi dùng `EnableRetryOnFailure()` trong EF Core, không thể dùng `BeginTransactionAsync()` thủ công vì conflict với retry strategy. Giải pháp: add cả 2 entity rồi gọi `SaveChangesAsync()` **một lần duy nhất** — EF Core tự wrap trong transaction ACID.
 
 ```csharp
-await using var transaction = await _db.Database.BeginTransactionAsync();
-// SQL: BEGIN TRANSACTION
+// PatientService.cs — cách thực tế, tương thích với EnableRetryOnFailure()
 
-try
-{
-    _db.Patients.Add(patient);
-    await _db.SaveChangesAsync();
-    // SQL: INSERT INTO Patients (...) — staged, chưa visible
+// BƯỚC 1: Stage Patient vào context (chưa lưu DB)
+_db.Patients.Add(patient);
+// Sau Add() → patient.Id đã được EF Core tự gán (Guid.NewGuid())
+// → Dùng được patient.Id cho OutboxMessage ngay lập tức
 
-    _db.OutboxMessages.Add(outboxMessage);
-    await _db.SaveChangesAsync();
-    // SQL: INSERT INTO OutboxMessages (...) — staged, chưa visible
+// BƯỚC 2: Stage OutboxMessage vào context (chưa lưu DB)
+_db.OutboxMessages.Add(outboxMessage);
 
-    await transaction.CommitAsync();
-    // SQL: COMMIT — TẤT CẢ trở nên permanent
-}
-catch
-{
-    await transaction.RollbackAsync();
-    // SQL: ROLLBACK — TẤT CẢ bị hủy hoàn toàn
-    throw;
-}
+// BƯỚC 3: Gọi SaveChangesAsync() MỘT LẦN DUY NHẤT
+// EF Core tự động phát hiện có 2 entity pending → wrap trong 1 transaction:
+//   BEGIN TRANSACTION
+//     INSERT INTO Patients (...)       ← INSERT 1
+//     INSERT INTO OutboxMessages (...)  ← INSERT 2
+//   COMMIT
+// Nếu INSERT nào fail → SQL Server tự ROLLBACK cả 2
+await _db.SaveChangesAsync();
+```
+
+**Tại sao không dùng `BeginTransactionAsync()` thủ công?**
+
+```
+EnableRetryOnFailure() tạo ra SqlServerRetryingExecutionStrategy.
+SaveChangesAsync() nội bộ cũng tạo một ExecutionStrategy riêng.
+Khi 2 strategy cùng tồn tại → EF Core phát hiện conflict và throw:
+  "SqlServerRetryingExecutionStrategy does not support user-initiated transactions"
+
+Giải pháp tốt nhất: Dùng implicit transaction của EF Core (1 SaveChangesAsync)
+→ Không conflict, ACID đảm bảo, code sạch hơn.
 ```
 
 ---
@@ -167,6 +177,95 @@ public class OutboxPublisherWorker : BackgroundService
 - `DbContext` → **Scoped** (tạo mới mỗi request, sau đó dispose)
 - Singleton **không được** giữ reference đến Scoped service
 - `IServiceScopeFactory` là Singleton-safe → tạo scope mới mỗi khi cần
+
+---
+
+## 🚚 OutboxPublisherWorker — Vai Trò & Ý Nghĩa
+
+### Vấn Đề Cần Giải Quyết
+
+Khi bệnh nhân đăng ký tại quầy tiếp đón (`ReceptionAPI`), `ClinicalAPI` cần biết để **tự động tạo hồ sơ bệnh án**. Nhưng hai service chạy độc lập — không gọi trực tiếp nhau.
+
+Cách truyền thông thường dùng **Message Broker** (Kafka, RabbitMQ). Nhưng nếu publish thẳng lên Kafka ngay lúc đăng ký:
+
+```
+❌ CÁCH NGUY HIỂM (không có Outbox):
+  1. INSERT vào Patients   → thành công ✅
+  2. Publish lên Kafka     → Kafka đang down! ❌
+  → Event mất vĩnh viễn
+  → ClinicalAPI không bao giờ tạo được hồ sơ bệnh án
+  → Dữ liệu 2 service mất đồng bộ, không có cách khôi phục
+```
+
+### OutboxPublisherWorker Giải Quyết Như Thế Nào?
+
+```
+✅ CÁCH AN TOÀN (có Outbox + Worker):
+
+  Bước 1 — PatientService (lúc đăng ký):
+    BEGIN TX
+      INSERT Patients        ← lưu bệnh nhân
+      INSERT OutboxMessages  ← lưu "giấy nhắn giao hàng" vào DB
+    COMMIT
+    → Dù Kafka down, "giấy nhắn" an toàn trong SQL Server
+
+  Bước 2 — OutboxPublisherWorker (mỗi 5 giây):
+    Quét OutboxMessages WHERE IsProcessed = false
+    → [Ngày 2] Log ra console
+    → [Ngày 3+] Publish lên Kafka thật
+    → Đánh dấu IsProcessed = true
+    → Kafka vẫn down? Worker tự retry 5 giây sau
+    → Kafka up trở lại? Worker publish thành công
+```
+
+### Vòng Đời Một Message Qua Worker
+
+```
+[POST /api/patients/register]
+        │
+        ▼
+OutboxMessages:
+  { Id: 'abc', EventType: 'PatientRegistered', IsProcessed: false, ProcessedAt: null }
+        │
+        │  ← Worker chạy, tìm thấy message này
+        ▼
+Worker LOG ra console:
+  📤 [OUTBOX] Publishing — EventType: PatientRegistered | PatientId: xyz
+        │
+        ▼
+OutboxMessages:
+  { Id: 'abc', EventType: 'PatientRegistered', IsProcessed: true, ProcessedAt: '2024-...' }
+        │
+        │  ← [Ngày 3] Kafka nhận event này
+        ▼
+ClinicalAPI tự động tạo hồ sơ bệnh án cho bệnh nhân
+```
+
+### Tại Sao Worker Chỉ Log Console Ở Ngày 2?
+
+Ngày 2 chưa có Kafka (sẽ setup ở Ngày 3). Worker log ra console để:
+- Chứng minh worker đang chạy đúng
+- Xác nhận message được tạo và đọc thành công
+- Chuẩn bị sẵn điểm để thay `LogInformation` bằng Kafka publish
+
+```csharp
+// OutboxPublisherWorker.cs — điểm sẽ thay thế ở Ngày 3
+_logger.LogInformation(
+    "📤 [OUTBOX] Publishing message — EventType: {EventType} | PatientId: {PatientId}",
+    message.EventType, message.PatientId);
+// ↑ Ngày 3: thay dòng này bằng: await _kafkaProducer.ProduceAsync("patient-events", message)
+```
+
+### Tóm Tắt Vai Trò
+
+| Câu hỏi | Trả lời |
+|---|---|
+| **Là gì?** | Background worker chạy ngầm suốt vòng đời app |
+| **Làm gì?** | Quét và xử lý các event chưa được publish |
+| **Tại sao cần?** | Đảm bảo không mất event dù Kafka/network bị lỗi |
+| **Hiện tại (Ngày 2)?** | Log ra console |
+| **Tương lai (Ngày 3+)?** | Publish lên Apache Kafka |
+| **Đảm bảo gì?** | Nếu bệnh nhân đã lưu vào DB, ClinicalAPI **chắc chắn** sẽ nhận được thông báo |
 
 ---
 
@@ -233,12 +332,124 @@ OUTBOX PATTERN:
 
 ---
 
+## 🖥️ Những Gì Bạn Thấy Trên Terminal
+
+Sau khi gọi `POST /api/patients/register`, terminal ReceptionAPI in ra:
+
+```
+# Ngay lập tức sau request:
+info: ReceptionAPI.Services.PatientService[0]
+      Staging Patient 'Nguyễn Văn An' (Id: 3f2a...) for registration...
+info: ReceptionAPI.Services.PatientService[0]
+      Staging OutboxMessage (EventType: PatientRegistered) for Patient 'Nguyễn Văn An'...
+info: ReceptionAPI.Services.PatientService[0]
+      ✅ Patient 'Nguyễn Văn An' (Id: 3f2a...) registered. OutboxMessage queued.
+
+# Tối đa 5 giây sau (Worker tìm thấy message):
+info: ReceptionAPI.BackgroundServices.OutboxPublisherWorker[0]
+      📬 Found 1 pending outbox message(s). Processing...
+info: ReceptionAPI.BackgroundServices.OutboxPublisherWorker[0]
+      📤 [OUTBOX] Publishing message — Id: abc | EventType: PatientRegistered
+      | PatientId: 3f2a... | CreatedAt: 2024-01-15 03:00:00 | Payload: {"PatientId":"3f2a...",...}
+info: ReceptionAPI.BackgroundServices.OutboxPublisherWorker[0]
+      ✅ Successfully marked 1 outbox message(s) as processed.
+```
+
+> 💡 Nếu terminal bị flood bởi EF Core SQL logs, thêm vào `appsettings.Development.json`:
+> ```json
+> "Microsoft.EntityFrameworkCore.Database.Command": "Warning"
+> ```
+
+---
+
+## 🚩 Ý Nghĩa Của `IsProcessed` — Tại Sao Quan Trọng?
+
+### `IsProcessed` Không Phải Dữ Liệu Gửi Đến Oracle
+
+Đây là điểm **dễ nhầm nhất**. `IsProcessed` chỉ là **trạng thái tracking nội bộ** của ReceptionAPI — giống như dấu "✓ Đã giao" trên một tờ phiếu giao hàng. Oracle và ClinicalAPI **không bao giờ đọc** bảng `OutboxMessages` trực tiếp.
+
+```
+IsProcessed = false  →  "Chưa gửi lên Kafka"  →  Worker sẽ xử lý
+IsProcessed = true   →  "Đã gửi lên Kafka"    →  Worker bỏ qua vĩnh viễn
+```
+
+### Tại Sao Phải Đánh Dấu `IsProcessed = true`?
+
+Để **tránh gửi trùng lặp lên Kafka**. Worker chạy mỗi 5 giây — nếu không có flag này:
+
+```
+❌ KHÔNG CÓ IsProcessed (thảm họa):
+  Lần quét 1: thấy message → gửi Kafka → ClinicalAPI tạo hồ sơ ✅
+  Lần quét 2: thấy lại message → gửi Kafka → ClinicalAPI tạo HỒ SƠ TRÙNG! ❌
+  Lần quét 3: thấy lại → gửi → tạo thêm hồ sơ nữa... ❌
+  → 1 bệnh nhân có hàng trăm hồ sơ bệnh án!
+
+✅ CÓ IsProcessed:
+  Lần quét 1: IsProcessed=false → gửi Kafka → set IsProcessed=true
+  Lần quét 2: IsProcessed=true  → Worker KHÔNG LẤY (WHERE IsProcessed=0)
+  → Kafka nhận đúng 1 event → ClinicalAPI tạo đúng 1 hồ sơ ✅
+```
+
+Worker chỉ query `WHERE IsProcessed = 0` — message đã `true` không bao giờ xuất hiện trong kết quả, không bao giờ được gửi lại.
+
+### Luồng Hoàn Chỉnh Qua 3 Hệ Thống (Ngày 3+)
+
+```
+ReceptionAPI (SQL Server)        Kafka Broker          ClinicalAPI (Oracle)
+────────────────────────       ──────────────         ──────────────────────
+
+[1] Bệnh nhân đăng ký
+    → Patients: INSERT          (chưa liên quan)       (chưa biết gì)
+    → OutboxMessages:
+        IsProcessed = false
+
+[2] Worker quét (5 giây sau)
+    → Thấy IsProcessed=false
+    → Publish event ──────────────────────────────────►
+    → UPDATE IsProcessed=true   Kafka lưu event         [3] ClinicalAPI NHẬN event
+                                 trong topic              → INSERT MedicalRecord
+                                 "patient-events"           vào Oracle ✅
+
+[Lần quét tiếp]
+    → WHERE IsProcessed=0
+    → Không có kết quả          (không gửi lại)         (không bị trùng)
+    → Nghỉ, chờ 5 giây tiếp
+```
+
+### Oracle Không Bao Giờ Đọc OutboxMessages
+
+```
+ReceptionAPI          ClinicalAPI
+(SQL Server)          (Oracle)
+    │                     │
+    │   KHÔNG có đường    │
+    │   kết nối trực tiếp │
+    │                     │
+    └──► Kafka ◄──────────┘
+         (cầu nối duy nhất)
+```
+
+`OutboxMessages` sau khi `IsProcessed = true` chỉ còn là **audit log** — bằng chứng rằng event đã được gửi thành công, dùng để debug khi cần truy vết.
+
+### Tóm Tắt Vai Trò Từng Trạng Thái
+
+| Trạng thái | Ý nghĩa | Worker làm gì? | ClinicalAPI biết không? |
+|---|---|---|---|
+| `IsProcessed = false` | Event chưa gửi Kafka | **Publish + set true** | Chưa |
+| `IsProcessed = true` | Event đã gửi Kafka | **Bỏ qua hoàn toàn** | Đã nhận qua Kafka |
+
+---
+
 ## ✅ Kết Quả Cuối Ngày 2
 
 - ✅ `POST /api/patients/register` hoạt động với validation đầy đủ
-- ✅ Patient và OutboxMessage được lưu trong cùng 1 Transaction (ACID)
+- ✅ Patient và OutboxMessage được lưu trong cùng 1 Transaction ACID (implicit, 1 lần SaveChanges)
+- ✅ Hiểu lý do **không dùng** `BeginTransactionAsync()` khi có `EnableRetryOnFailure()`
 - ✅ `OutboxPublisherWorker` chạy ngầm mỗi 5 giây, log ra console
-- ✅ Message được đánh dấu `IsProcessed = true` sau khi xử lý
-- ✅ Hiểu cơ chế `IServiceScopeFactory` trong BackgroundService
+- ✅ Hiểu vai trò worker: "người giao hàng" đảm bảo ClinicalAPI luôn nhận được event
+- ✅ Hiểu cơ chế `IServiceScopeFactory` trong BackgroundService (Singleton vs Scoped)
+- ✅ Hiểu `IsProcessed` flag: tránh gửi trùng lặp, không liên quan trực tiếp đến Oracle
+- ✅ Hiểu ClinicalAPI **chỉ nhận event qua Kafka**, không đọc OutboxMessages của ReceptionAPI
 
-**Ngày 3:** Thay thế "log ra console" bằng publish thực sự lên **Apache Kafka**.
+**Ngày 3:** Thay thế "log ra console" bằng publish thực sự lên **Apache Kafka** và ClinicalAPI sẽ tự động nhận event tạo hồ sơ bệnh án.
+
