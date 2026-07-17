@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using ClinicalAPI.Data;
+using ClinicalAPI.BackgroundServices;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -17,8 +18,9 @@ builder.Services.AddDbContext<ClinicalDbContext>(options =>
         }));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. CÁC DỊCH VỤ TIÊU CHUẨN
+// 2. CÁC DỊCH VỤ TIÊU CHUẨN & BACKGROUND SERVICES
 // ─────────────────────────────────────────────────────────────────────────────
+builder.Services.AddHostedService<KafkaConsumerWorker>();
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
